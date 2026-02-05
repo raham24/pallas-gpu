@@ -10,19 +10,19 @@ This crate provides CUDA-accelerated MSM for the Pallas curve, designed for inte
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  MSM Algorithm (Pippenger)                    ← HIGH LEVEL │
+│  MSM Algorithm (Pippenger)                    ← HIGH LEVEL  │
 │  Complexity: O(n / log(n))                                  │
 │  ├── Window decomposition: split scalars into c-bit chunks  │
 │  ├── Bucket accumulation: points sorted by window value     │
-│  └── Summation by parts: 3a+2b+c = a+(a+b)+(a+b+c)         │
+│  └── Summation by parts: 3a+2b+c = a+(a+b)+(a+b+c)          │
 ├─────────────────────────────────────────────────────────────┤
-│  Group Operations                           ← MIDDLE LEVEL │
+│  Group Operations                           ← MIDDLE LEVEL  │
 │  ├── Point addition: P + Q                                  │
 │  ├── Point doubling: 2P                                     │
 │  ├── Mixed addition: Projective + Affine                    │
 │  └── Affine conversion                                      │
 ├─────────────────────────────────────────────────────────────┤
-│  Field Arithmetic (Montgomery CIOS)          ← LOW LEVEL   │
+│  Field Arithmetic (Montgomery CIOS)          ← LOW LEVEL    │
 │  ├── Field multiplication: a × b mod p                      │
 │  ├── Field addition/subtraction                             │
 │  ├── Field inversion (Fermat's little theorem)              │
@@ -110,6 +110,3 @@ pallas-gpu/
     └── msm_benchmark.rs  # Performance benchmarks
 ```
 
-## License
-
-MIT OR Apache-2.0
