@@ -11,15 +11,18 @@ namespace pallas {
 // ============================================================================
 
 // Window size for Pippenger's algorithm
-// Optimal c ≈ ln(n), but we use a fixed value for simplicity
-// Can be made dynamic based on input size
+// Optimal c ≈ ln(n), but 8 works well for most sizes
 #define MSM_WINDOW_SIZE 8
 #define MSM_NUM_BUCKETS ((1 << MSM_WINDOW_SIZE) - 1)  // 2^c - 1 = 255
+#define MSM_NUM_WINDOWS ((256 + MSM_WINDOW_SIZE - 1) / MSM_WINDOW_SIZE)  // 32 windows
+
+// Parallelization config
+#define THREADS_PER_BLOCK 256
+#define POINTS_PER_THREAD 4  // Each thread handles multiple points
 
 // ============================================================================
 // Helper: Extract window from scalar
 // ============================================================================
-// Extracts a c-bit window from scalar starting at bit position `start_bit`
 
 __device__ inline uint32_t get_window(const uint32_t* scalar, int start_bit, int window_size) {
     int limb_idx = start_bit / 32;
@@ -31,7 +34,6 @@ __device__ inline uint32_t get_window(const uint32_t* scalar, int start_bit, int
 
     // Handle case where window spans two limbs
     if (bit_offset + window_size > 32 && limb_idx + 1 < LIMBS) {
-        int remaining_bits = bit_offset + window_size - 32;
         window |= (scalar[limb_idx + 1] << (32 - bit_offset));
     }
 
@@ -41,87 +43,218 @@ __device__ inline uint32_t get_window(const uint32_t* scalar, int start_bit, int
 }
 
 // ============================================================================
+// Parallel Bucket Accumulation Kernel
+// ============================================================================
+// Each block processes a chunk of points for ONE window.
+// Uses shared memory for local bucket accumulation, then writes to global.
+
+__global__ void msm_bucket_accumulate_kernel(
+    projective_point_t* g_buckets,       // [num_windows * num_buckets] global buckets
+    const affine_point_t* points,        // Input points
+    const uint32_t* scalars,             // Input scalars
+    int num_points,
+    int window_idx                       // Which window this kernel processes
+) {
+    // Shared memory for this block's local buckets
+    __shared__ projective_point_t s_buckets[MSM_NUM_BUCKETS];
+
+    int tid = threadIdx.x;
+    int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Initialize shared buckets (each thread initializes some buckets)
+    for (int b = tid; b < MSM_NUM_BUCKETS; b += blockDim.x) {
+        point_set_identity_projective(&s_buckets[b]);
+    }
+    __syncthreads();
+
+    // Calculate which points this thread processes
+    int start_bit = window_idx * MSM_WINDOW_SIZE;
+
+    // Each thread processes multiple points with striding
+    for (int i = global_idx; i < num_points; i += gridDim.x * blockDim.x) {
+        const affine_point_t* point = &points[i];
+
+        // Skip identity points
+        if (point_is_identity_affine(point)) continue;
+
+        const uint32_t* scalar = &scalars[i * LIMBS];
+        uint32_t window_val = get_window(scalar, start_bit, MSM_WINDOW_SIZE);
+
+        if (window_val == 0) continue;
+
+        int bucket_idx = window_val - 1;
+
+        // Atomic-free accumulation using critical section
+        // Each thread adds to bucket sequentially within the block
+        // This is slow but correct - optimize with atomics or sorting later
+        for (int t = 0; t < blockDim.x; t++) {
+            if (tid == t) {
+                point_add_mixed(&s_buckets[bucket_idx], &s_buckets[bucket_idx], point);
+            }
+            __syncthreads();
+        }
+    }
+    __syncthreads();
+
+    // Write shared buckets to global memory (accumulate with existing)
+    int bucket_offset = window_idx * MSM_NUM_BUCKETS;
+    for (int b = tid; b < MSM_NUM_BUCKETS; b += blockDim.x) {
+        // Atomic add to global buckets (using point addition)
+        // Since multiple blocks may write to same window, we need atomics
+        // For now, we'll use a single block per window to avoid this
+        point_add(&g_buckets[bucket_offset + b], &g_buckets[bucket_offset + b], &s_buckets[b]);
+    }
+}
+
+// ============================================================================
 // Bucket Reduction Kernel
 // ============================================================================
-// Reduces buckets using "summation by parts":
-// sum(i * bucket[i]) = bucket[n] + (bucket[n] + bucket[n-1]) + ... =
-// running sum from high to low, accumulated
+// Reduces buckets for each window using "summation by parts"
+// Each block handles one window
 
-__device__ void reduce_buckets(
-    projective_point_t* result,
-    projective_point_t* buckets,
-    int num_buckets
+__global__ void msm_bucket_reduce_kernel(
+    projective_point_t* window_sums,     // Output: one sum per window
+    const projective_point_t* buckets,   // Input: all buckets [num_windows * num_buckets]
+    int num_windows
 ) {
+    int window_idx = blockIdx.x;
+    if (window_idx >= num_windows) return;
+
+    // Only thread 0 does the reduction (sequential within window)
+    if (threadIdx.x != 0) return;
+
+    const projective_point_t* window_buckets = &buckets[window_idx * MSM_NUM_BUCKETS];
+
     projective_point_t running_sum;
     projective_point_t total;
 
     point_set_identity_projective(&running_sum);
     point_set_identity_projective(&total);
 
-    // Iterate from highest bucket to lowest
-    for (int i = num_buckets - 1; i >= 0; i--) {
-        // running_sum += bucket[i]
-        point_add(&running_sum, &running_sum, &buckets[i]);
-        // total += running_sum
+    // Summation by parts: sum(i * bucket[i])
+    // = bucket[n] + (bucket[n] + bucket[n-1]) + ...
+    for (int i = MSM_NUM_BUCKETS - 1; i >= 0; i--) {
+        point_add(&running_sum, &running_sum, &window_buckets[i]);
         point_add(&total, &total, &running_sum);
     }
 
-    point_copy_projective(result, &total);
+    point_copy_projective(&window_sums[window_idx], &total);
 }
 
 // ============================================================================
-// Simple Parallel MSM Kernel (Phase 1: Accumulate into buckets)
+// Window Combination Kernel
 // ============================================================================
-// Each thread handles one scalar-point pair, atomically accumulates into buckets
-// Note: This is a simplified version. Production would use more sophisticated
-// bucket management to avoid atomic contention.
+// Combines window sums: result = sum(window_sum[i] * 2^(i*window_size))
+// Single thread - could parallelize but window combination is fast
 
-__global__ void msm_accumulate_kernel(
-    projective_point_t* buckets,       // [num_windows * num_buckets] buckets
-    const affine_point_t* points,      // Input points
-    const uint32_t* scalars,           // Input scalars (LIMBS * num_points)
-    int num_points,
-    int window_size,
-    int num_windows,
-    int num_buckets
+__global__ void msm_combine_windows_kernel(
+    projective_point_t* result,
+    const projective_point_t* window_sums,
+    int num_windows
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_points) return;
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
-    const affine_point_t* point = &points[idx];
-    const uint32_t* scalar = &scalars[idx * LIMBS];
+    projective_point_t acc;
+    point_set_identity_projective(&acc);
 
-    // Skip if point is identity
-    if (point_is_identity_affine(point)) return;
+    // Process from highest window to lowest
+    for (int w = num_windows - 1; w >= 0; w--) {
+        // Double accumulator by window_size bits (shift left)
+        for (int d = 0; d < MSM_WINDOW_SIZE; d++) {
+            point_double(&acc, &acc);
+        }
+        // Add this window's contribution
+        point_add(&acc, &acc, &window_sums[w]);
+    }
 
-    // For each window
-    for (int w = 0; w < num_windows; w++) {
-        int start_bit = w * window_size;
-        uint32_t window_val = get_window(scalar, start_bit, window_size);
+    point_copy_projective(result, &acc);
+}
 
-        // Skip if window value is 0 (no contribution to any bucket)
-        if (window_val == 0) continue;
+// ============================================================================
+// Alternative: Single-Kernel Parallel MSM (Better for smaller inputs)
+// ============================================================================
+// Each block handles all points for one window
 
-        // Bucket index (window_val - 1 because we don't have a zero bucket)
-        int bucket_idx = w * num_buckets + (window_val - 1);
+__global__ void msm_single_kernel(
+    projective_point_t* window_sums,     // Output: one sum per window [num_windows]
+    const affine_point_t* points,
+    const uint32_t* scalars,
+    int num_points
+) {
+    int window_idx = blockIdx.x;
+    if (window_idx >= MSM_NUM_WINDOWS) return;
 
-        // Add point to bucket
-        // Note: This is a critical section. In production, use better synchronization
-        // or per-thread local accumulation followed by reduction
-        projective_point_t temp;
-        affine_to_projective(&temp, point);
+    int tid = threadIdx.x;
 
-        // Simple atomic-free version: each thread writes to shared memory
-        // then reduce. For now, just direct addition (race condition!)
-        // TODO: Implement proper bucket accumulation with atomics or reduction
-        point_add_mixed(&buckets[bucket_idx], &buckets[bucket_idx], point);
+    // Shared memory buckets for this window
+    __shared__ projective_point_t s_buckets[MSM_NUM_BUCKETS];
+
+    // Initialize buckets
+    for (int b = tid; b < MSM_NUM_BUCKETS; b += blockDim.x) {
+        point_set_identity_projective(&s_buckets[b]);
+    }
+    __syncthreads();
+
+    int start_bit = window_idx * MSM_WINDOW_SIZE;
+
+    // Each thread accumulates its assigned points into local temp
+    // Then we do a sequential merge (to avoid race conditions)
+
+    // Process points in strided fashion
+    for (int base = 0; base < num_points; base += blockDim.x) {
+        int i = base + tid;
+
+        uint32_t window_val = 0;
+        affine_point_t local_point;
+        bool valid = false;
+
+        if (i < num_points) {
+            const affine_point_t* point = &points[i];
+            if (!point_is_identity_affine(point)) {
+                const uint32_t* scalar = &scalars[i * LIMBS];
+                window_val = get_window(scalar, start_bit, MSM_WINDOW_SIZE);
+                if (window_val > 0) {
+                    // Copy point to local
+                    for (int l = 0; l < LIMBS; l++) {
+                        local_point.x.limbs[l] = point->x.limbs[l];
+                        local_point.y.limbs[l] = point->y.limbs[l];
+                    }
+                    valid = true;
+                }
+            }
+        }
+
+        // Sequential accumulation - each thread takes a turn
+        for (int t = 0; t < blockDim.x; t++) {
+            if (tid == t && valid) {
+                int bucket_idx = window_val - 1;
+                point_add_mixed(&s_buckets[bucket_idx], &s_buckets[bucket_idx], &local_point);
+            }
+            __syncthreads();
+        }
+    }
+    __syncthreads();
+
+    // Thread 0 does bucket reduction
+    if (tid == 0) {
+        projective_point_t running_sum;
+        projective_point_t total;
+
+        point_set_identity_projective(&running_sum);
+        point_set_identity_projective(&total);
+
+        for (int i = MSM_NUM_BUCKETS - 1; i >= 0; i--) {
+            point_add(&running_sum, &running_sum, &s_buckets[i]);
+            point_add(&total, &total, &running_sum);
+        }
+
+        point_copy_projective(&window_sums[window_idx], &total);
     }
 }
 
 // ============================================================================
-// MSM Serial (for reference/testing)
+// MSM Serial (kept for reference/small inputs)
 // ============================================================================
-// Single-threaded Pippenger implementation
 
 __device__ void msm_serial(
     projective_point_t* result,
@@ -131,25 +264,21 @@ __device__ void msm_serial(
 ) {
     const int window_size = MSM_WINDOW_SIZE;
     const int num_buckets = MSM_NUM_BUCKETS;
-    const int num_windows = (256 + window_size - 1) / window_size;
+    const int num_windows = MSM_NUM_WINDOWS;
 
     projective_point_t acc;
     point_set_identity_projective(&acc);
 
-    // Process windows from high to low
     for (int w = num_windows - 1; w >= 0; w--) {
-        // Double accumulator by window_size bits
         for (int d = 0; d < window_size; d++) {
             point_double(&acc, &acc);
         }
 
-        // Initialize buckets for this window
         projective_point_t buckets[MSM_NUM_BUCKETS];
         for (int b = 0; b < num_buckets; b++) {
             point_set_identity_projective(&buckets[b]);
         }
 
-        // Accumulate points into buckets
         int start_bit = w * window_size;
         for (int i = 0; i < num_points; i++) {
             const uint32_t* scalar = &scalars[i * LIMBS];
@@ -161,29 +290,28 @@ __device__ void msm_serial(
             }
         }
 
-        // Reduce buckets using summation by parts
-        projective_point_t window_sum;
-        reduce_buckets(&window_sum, buckets, num_buckets);
+        // Reduce buckets
+        projective_point_t running_sum, window_sum;
+        point_set_identity_projective(&running_sum);
+        point_set_identity_projective(&window_sum);
 
-        // Add window sum to accumulator
+        for (int i = num_buckets - 1; i >= 0; i--) {
+            point_add(&running_sum, &running_sum, &buckets[i]);
+            point_add(&window_sum, &window_sum, &running_sum);
+        }
+
         point_add(&acc, &acc, &window_sum);
     }
 
     point_copy_projective(result, &acc);
 }
 
-// ============================================================================
-// MSM Kernel (Wrapper)
-// ============================================================================
-
-__global__ void msm_kernel(
+__global__ void msm_serial_kernel(
     const affine_point_t* points,
     const uint32_t* scalars,
     projective_point_t* result,
     int num_points
 ) {
-    // For now, use serial implementation on single thread
-    // TODO: Implement parallel version with proper bucket management
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         msm_serial(result, points, scalars, num_points);
     }
@@ -197,7 +325,6 @@ __global__ void msm_kernel(
 
 extern "C" {
 
-// Select the best available GPU (discrete GPU preferred over integrated)
 static bool g_device_selected = false;
 
 void select_best_gpu() {
@@ -217,15 +344,12 @@ void select_best_gpu() {
     for (int i = 0; i < device_count; i++) {
         cudaDeviceProp prop;
         cudaGetDeviceProperties(&prop, i);
-
-        // Calculate SM count (multiProcessorCount)
         int sm_count = prop.multiProcessorCount;
 
         printf("GPU %d: %s (SMs: %d, Compute: %d.%d, Memory: %lu MB)\n",
                i, prop.name, sm_count, prop.major, prop.minor,
                prop.totalGlobalMem / (1024 * 1024));
 
-        // Prefer device with more SMs (discrete GPUs have more)
         if (sm_count > best_sm_count) {
             best_sm_count = sm_count;
             best_device = i;
@@ -237,63 +361,76 @@ void select_best_gpu() {
     g_device_selected = true;
 }
 
-// GPU MSM entry point
+// GPU MSM entry point - uses parallel implementation
 cudaError_t pallas_msm_gpu(
     const pallas::affine_point_t* h_points,
     const uint32_t* h_scalars,
     pallas::projective_point_t* h_result,
     size_t num_points
 ) {
-    // Select best GPU on first call
     select_best_gpu();
 
     if (num_points == 0) {
-        // Return identity
         for (int i = 0; i < pallas::LIMBS; i++) {
             h_result->x.limbs[i] = 0;
-            h_result->y.limbs[i] = pallas::host::R_SQUARED[i]; // 1 in Montgomery form
+            h_result->y.limbs[i] = 0;
             h_result->z.limbs[i] = 0;
         }
+        // Set Y = 1 for identity in projective (0:1:0)
+        h_result->y.limbs[0] = 1;
         return cudaSuccess;
     }
 
-    pallas::affine_point_t* d_points;
-    uint32_t* d_scalars;
-    pallas::projective_point_t* d_result;
+    cudaError_t err;
+
+    // Device memory
+    pallas::affine_point_t* d_points = nullptr;
+    uint32_t* d_scalars = nullptr;
+    pallas::projective_point_t* d_window_sums = nullptr;
+    pallas::projective_point_t* d_result = nullptr;
 
     size_t points_size = num_points * sizeof(pallas::affine_point_t);
     size_t scalars_size = num_points * pallas::LIMBS * sizeof(uint32_t);
+    size_t window_sums_size = MSM_NUM_WINDOWS * sizeof(pallas::projective_point_t);
     size_t result_size = sizeof(pallas::projective_point_t);
 
-    // Allocate device memory
-    cudaError_t err;
+    // Allocate
     err = cudaMalloc(&d_points, points_size);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) goto cleanup;
 
     err = cudaMalloc(&d_scalars, scalars_size);
-    if (err != cudaSuccess) {
-        cudaFree(d_points);
-        return err;
-    }
+    if (err != cudaSuccess) goto cleanup;
+
+    err = cudaMalloc(&d_window_sums, window_sums_size);
+    if (err != cudaSuccess) goto cleanup;
 
     err = cudaMalloc(&d_result, result_size);
-    if (err != cudaSuccess) {
-        cudaFree(d_points);
-        cudaFree(d_scalars);
-        return err;
-    }
+    if (err != cudaSuccess) goto cleanup;
 
-    // Copy data to device
+    // Copy inputs
     err = cudaMemcpy(d_points, h_points, points_size, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) goto cleanup;
 
     err = cudaMemcpy(d_scalars, h_scalars, scalars_size, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) goto cleanup;
 
-    // Launch kernel
-    // Using single block/thread for serial implementation
-    // TODO: Launch parallel kernel with appropriate grid/block size
-    pallas::msm_kernel<<<1, 1>>>(d_points, d_scalars, d_result, num_points);
+    // Choose implementation based on input size
+    if (num_points < 64) {
+        // Small inputs: use serial kernel (overhead of parallel not worth it)
+        pallas::msm_serial_kernel<<<1, 1>>>(d_points, d_scalars, d_result, num_points);
+    } else {
+        // Parallel implementation:
+        // Phase 1: Each block processes one window (32 blocks, 256 threads each)
+        pallas::msm_single_kernel<<<MSM_NUM_WINDOWS, THREADS_PER_BLOCK>>>(
+            d_window_sums, d_points, d_scalars, num_points
+        );
+
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto cleanup;
+
+        // Phase 2: Combine windows (single thread)
+        pallas::msm_combine_windows_kernel<<<1, 1>>>(d_result, d_window_sums, MSM_NUM_WINDOWS);
+    }
 
     err = cudaGetLastError();
     if (err != cudaSuccess) goto cleanup;
@@ -301,26 +438,26 @@ cudaError_t pallas_msm_gpu(
     err = cudaDeviceSynchronize();
     if (err != cudaSuccess) goto cleanup;
 
-    // Copy result back
+    // Copy result
     err = cudaMemcpy(h_result, d_result, result_size, cudaMemcpyDeviceToHost);
 
 cleanup:
-    cudaFree(d_points);
-    cudaFree(d_scalars);
-    cudaFree(d_result);
+    if (d_points) cudaFree(d_points);
+    if (d_scalars) cudaFree(d_scalars);
+    if (d_window_sums) cudaFree(d_window_sums);
+    if (d_result) cudaFree(d_result);
 
     return err;
 }
 
-// Batch field multiplication (for testing)
+// Keep for testing
 void pallas_field_mul_batch(
     uint32_t* h_results,
     const uint32_t* h_a,
     const uint32_t* h_b,
     int count
 ) {
-    // TODO: Implement batch field multiplication kernel
-    // For now, this is a placeholder
+    // Placeholder
 }
 
 } // extern "C"
