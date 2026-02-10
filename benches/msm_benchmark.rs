@@ -43,7 +43,7 @@ fn bench_msm_gpu(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(5));
 
     // Test sizes from small to large
-    for size in [100, 1000, 10_000, 100_000].iter() {
+    for size in [100, 1000, 10_000, 100_000, 1000_000, 10_000_000].iter() {
         let points: Vec<AffinePointGpu> = (0..*size).map(|_| random_point()).collect();
         let scalars: Vec<[u32; LIMBS]> = (0..*size).map(|_| random_scalar()).collect();
         let flat_scalars: Vec<u32> = scalars.iter().flat_map(|s| s.iter().copied()).collect();

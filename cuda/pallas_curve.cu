@@ -72,18 +72,17 @@ __device__ void projective_to_affine(affine_point_t* result, const projective_po
 // Point Doubling
 // ============================================================================
 // Formula for short Weierstrass curve y^2 = x^3 + b (a = 0)
-// Using projective coordinates (X : Y : Z) where affine = (X/Z, Y/Z)
+// Using homogeneous projective coordinates (X : Y : Z) where affine = (X/Z, Y/Z)
 //
 // 2(X1, Y1, Z1) = (X3, Y3, Z3)
-// Standard doubling formula for a = 0:
-// XX = X1^2
-// YY = Y1^2
-// ZZ = Z1^2
-// S = 4 * X1 * YY
-// M = 3 * XX
-// X3 = M^2 - 2*S
-// Y3 = M * (S - X3) - 8 * YY^2
-// Z3 = 2 * Y1 * Z1
+// Homogeneous projective doubling formula for a = 0:
+// W = 3 * X1^2
+// S = Y1 * Z1
+// B = X1 * Y1 * S
+// H = W^2 - 8 * B
+// X3 = 2 * H * S
+// Y3 = W * (4*B - H) - 8 * (Y1*S)^2
+// Z3 = 8 * S^3
 
 __device__ void point_double(projective_point_t* result, const projective_point_t* p) {
     // Handle identity
@@ -98,50 +97,65 @@ __device__ void point_double(projective_point_t* result, const projective_point_
         return;
     }
 
-    fq_t XX, YY, ZZ, S, M, t1, t2, t3;
+    fq_t W, S, B, H, t1, t2;
 
-    // XX = X1^2
-    fq_sqr(&XX, &p->x);
+    // W = 3 * X1^2  (a = 0 for Pallas, so no a*Z1^2 term)
+    fq_sqr(&t1, &p->x);              // t1 = X1^2
+    fq_add(&W, &t1, &t1);            // W = 2 * X1^2
+    fq_add(&W, &W, &t1);             // W = 3 * X1^2
 
-    // YY = Y1^2
-    fq_sqr(&YY, &p->y);
+    // S = Y1 * Z1
+    fq_mul(&S, &p->y, &p->z);        // S = Y1 * Z1
 
-    // ZZ = Z1^2 (not used in this simplified formula but kept for reference)
-    fq_sqr(&ZZ, &p->z);
+    // B = X1 * Y1 * S
+    fq_mul(&t1, &p->x, &p->y);       // t1 = X1 * Y1
+    fq_mul(&B, &t1, &S);             // B = X1 * Y1 * S
 
-    // S = 4 * X1 * YY = 2 * (2 * X1 * YY)
-    fq_mul(&t1, &p->x, &YY);    // t1 = X1 * YY
-    fq_add(&t1, &t1, &t1);       // t1 = 2 * X1 * YY
-    fq_add(&S, &t1, &t1);        // S = 4 * X1 * YY
+    // H = W^2 - 8 * B
+    fq_sqr(&H, &W);                  // H = W^2
+    fq_add(&t1, &B, &B);             // t1 = 2*B
+    fq_add(&t1, &t1, &t1);           // t1 = 4*B
+    fq_add(&t1, &t1, &t1);           // t1 = 8*B
+    fq_sub(&H, &H, &t1);             // H = W^2 - 8*B
 
-    // M = 3 * XX
-    fq_add(&t1, &XX, &XX);       // t1 = 2 * XX
-    fq_add(&M, &t1, &XX);        // M = 3 * XX
+    // X3 = 2 * H * S
+    fq_mul(&t1, &H, &S);             // t1 = H * S
+    fq_add(&result->x, &t1, &t1);    // X3 = 2 * H * S
 
-    // X3 = M^2 - 2*S
-    fq_sqr(&t1, &M);             // t1 = M^2
-    fq_add(&t2, &S, &S);         // t2 = 2*S
-    fq_sub(&result->x, &t1, &t2); // X3 = M^2 - 2*S
+    // Y3 = W * (4*B - H) - 8 * (Y1*S)^2
+    fq_add(&t1, &B, &B);             // t1 = 2*B
+    fq_add(&t1, &t1, &t1);           // t1 = 4*B
+    fq_sub(&t1, &t1, &H);            // t1 = 4*B - H
+    fq_mul(&t1, &W, &t1);            // t1 = W * (4*B - H)
+    fq_mul(&t2, &p->y, &S);          // t2 = Y1 * S
+    fq_sqr(&t2, &t2);                // t2 = (Y1*S)^2
+    fq_add(&t2, &t2, &t2);           // t2 = 2*(Y1*S)^2
+    fq_add(&t2, &t2, &t2);           // t2 = 4*(Y1*S)^2
+    fq_add(&t2, &t2, &t2);           // t2 = 8*(Y1*S)^2
+    fq_sub(&result->y, &t1, &t2);    // Y3 = W*(4*B - H) - 8*(Y1*S)^2
 
-    // Y3 = M * (S - X3) - 8 * YY^2
-    fq_sub(&t1, &S, &result->x); // t1 = S - X3
-    fq_mul(&t2, &M, &t1);        // t2 = M * (S - X3)
-    fq_sqr(&t1, &YY);            // t1 = YY^2
-    fq_add(&t1, &t1, &t1);       // t1 = 2 * YY^2
-    fq_add(&t1, &t1, &t1);       // t1 = 4 * YY^2
-    fq_add(&t1, &t1, &t1);       // t1 = 8 * YY^2
-    fq_sub(&result->y, &t2, &t1); // Y3 = M * (S - X3) - 8 * YY^2
-
-    // Z3 = 2 * Y1 * Z1
-    fq_mul(&t1, &p->y, &p->z);   // t1 = Y1 * Z1
-    fq_add(&result->z, &t1, &t1); // Z3 = 2 * Y1 * Z1
+    // Z3 = 8 * S^3
+    fq_sqr(&t1, &S);                 // t1 = S^2
+    fq_mul(&t1, &t1, &S);            // t1 = S^3
+    fq_add(&t1, &t1, &t1);           // t1 = 2*S^3
+    fq_add(&t1, &t1, &t1);           // t1 = 4*S^3
+    fq_add(&result->z, &t1, &t1);    // Z3 = 8*S^3
 }
 
 // ============================================================================
 // Point Addition (Projective + Projective)
 // ============================================================================
-// Standard addition formula for short Weierstrass curves
-// P + Q where P = (X1:Y1:Z1), Q = (X2:Y2:Z2)
+// Homogeneous projective addition (add-1998-cmo-2 from EFD)
+// P + Q where P = (X1:Y1:Z1), Q = (X2:Y2:Z2), affine = (X/Z, Y/Z)
+//
+// u = Y2*Z1 - Y1*Z2
+// v = X2*Z1 - X1*Z2
+// vv = v^2, vvv = v^3
+// R = vv * X1 * Z2
+// A = u^2 * Z1*Z2 - vvv - 2*R
+// X3 = v * A
+// Y3 = u * (R - A) - vvv * Y1*Z2
+// Z3 = vvv * Z1*Z2
 
 __device__ void point_add(projective_point_t* result, const projective_point_t* p, const projective_point_t* q) {
     // Handle identity cases
@@ -154,63 +168,75 @@ __device__ void point_add(projective_point_t* result, const projective_point_t* 
         return;
     }
 
-    fq_t U1, U2, S1, S2, H, R, HH, HHH, V, t1, t2;
+    fq_t u, v, uu, vv, vvv, R_val, A, Z1Z2, S1, t1, t2;
 
-    // U1 = X1 * Z2
-    fq_mul(&U1, &p->x, &q->z);
-    // U2 = X2 * Z1
-    fq_mul(&U2, &q->x, &p->z);
-    // S1 = Y1 * Z2
-    fq_mul(&S1, &p->y, &q->z);
-    // S2 = Y2 * Z1
-    fq_mul(&S2, &q->y, &p->z);
+    // u = Y2*Z1 - Y1*Z2
+    fq_mul(&t1, &q->y, &p->z);       // t1 = Y2*Z1
+    fq_mul(&t2, &p->y, &q->z);       // t2 = Y1*Z2 (= S1, save for later)
+    fq_copy(&S1, &t2);               // S1 = Y1*Z2 (needed for Y3)
+    fq_sub(&u, &t1, &t2);            // u = Y2*Z1 - Y1*Z2
 
-    // H = U2 - U1
-    fq_sub(&H, &U2, &U1);
-    // R = S2 - S1
-    fq_sub(&R, &S2, &S1);
+    // v = X2*Z1 - X1*Z2
+    fq_mul(&t1, &q->x, &p->z);       // t1 = X2*Z1
+    fq_mul(&t2, &p->x, &q->z);       // t2 = X1*Z2 (= U1, save for R_val)
+    fq_sub(&v, &t1, &t2);            // v = X2*Z1 - X1*Z2
 
-    // Check if points are the same (H = 0 and R = 0 -> doubling case)
-    if (fq_is_zero(&H) && fq_is_zero(&R)) {
+    // Check if points are the same (v = 0 and u = 0 -> doubling case)
+    if (fq_is_zero(&v) && fq_is_zero(&u)) {
         point_double(result, p);
         return;
     }
 
-    // Check if points are negatives (H = 0 and R != 0 -> result is identity)
-    if (fq_is_zero(&H)) {
+    // Check if points are negatives (v = 0 and u != 0 -> result is identity)
+    if (fq_is_zero(&v)) {
         point_set_identity_projective(result);
         return;
     }
 
-    // HH = H^2
-    fq_sqr(&HH, &H);
-    // HHH = H * HH
-    fq_mul(&HHH, &H, &HH);
-    // V = U1 * HH
-    fq_mul(&V, &U1, &HH);
+    // Z1Z2 = Z1 * Z2
+    fq_mul(&Z1Z2, &p->z, &q->z);
 
-    // X3 = R^2 - HHH - 2*V
-    fq_sqr(&t1, &R);             // t1 = R^2
-    fq_sub(&t1, &t1, &HHH);      // t1 = R^2 - HHH
-    fq_add(&t2, &V, &V);         // t2 = 2*V
-    fq_sub(&result->x, &t1, &t2); // X3 = R^2 - HHH - 2*V
+    // vv = v^2
+    fq_sqr(&vv, &v);
+    // vvv = v^3
+    fq_mul(&vvv, &v, &vv);
+    // R_val = vv * X1*Z2 = vv * t2 (t2 still holds X1*Z2)
+    fq_mul(&R_val, &vv, &t2);
 
-    // Y3 = R * (V - X3) - S1 * HHH
-    fq_sub(&t1, &V, &result->x); // t1 = V - X3
-    fq_mul(&t1, &R, &t1);        // t1 = R * (V - X3)
-    fq_mul(&t2, &S1, &HHH);      // t2 = S1 * HHH
-    fq_sub(&result->y, &t1, &t2); // Y3 = R * (V - X3) - S1 * HHH
+    // A = u^2 * Z1Z2 - vvv - 2*R_val
+    fq_sqr(&uu, &u);                 // uu = u^2
+    fq_mul(&A, &uu, &Z1Z2);          // A = u^2 * Z1Z2
+    fq_sub(&A, &A, &vvv);            // A = u^2*Z1Z2 - vvv
+    fq_add(&t1, &R_val, &R_val);     // t1 = 2*R_val
+    fq_sub(&A, &A, &t1);             // A = u^2*Z1Z2 - vvv - 2*R_val
 
-    // Z3 = Z1 * Z2 * H
-    fq_mul(&t1, &p->z, &q->z);   // t1 = Z1 * Z2
-    fq_mul(&result->z, &t1, &H); // Z3 = Z1 * Z2 * H
+    // X3 = v * A
+    fq_mul(&result->x, &v, &A);
+
+    // Y3 = u * (R_val - A) - vvv * S1
+    fq_sub(&t1, &R_val, &A);         // t1 = R_val - A
+    fq_mul(&t1, &u, &t1);            // t1 = u * (R_val - A)
+    fq_mul(&t2, &vvv, &S1);          // t2 = vvv * Y1*Z2
+    fq_sub(&result->y, &t1, &t2);    // Y3 = u*(R_val-A) - vvv*S1
+
+    // Z3 = vvv * Z1Z2
+    fq_mul(&result->z, &vvv, &Z1Z2);
 }
 
 // ============================================================================
 // Mixed Addition (Projective + Affine)
 // ============================================================================
-// More efficient when one point is in affine form (Z = 1)
-// P (projective) + Q (affine)
+// Homogeneous projective mixed addition (add-1998-cmo-2 specialized for Z2=1)
+// P (projective) + Q (affine), affine = (X/Z, Y/Z)
+//
+// u = Y2*Z1 - Y1
+// v = X2*Z1 - X1
+// vv = v^2, vvv = v^3
+// R = vv * X1
+// A = u^2 * Z1 - vvv - 2*R
+// X3 = v * A
+// Y3 = u * (R - A) - vvv * Y1
+// Z3 = vvv * Z1
 
 __device__ void point_add_mixed(projective_point_t* result, const projective_point_t* p, const affine_point_t* q) {
     // Handle identity cases
@@ -223,56 +249,53 @@ __device__ void point_add_mixed(projective_point_t* result, const projective_poi
         return;
     }
 
-    fq_t U1, S1, H, R, HH, HHH, V, t1, t2;
+    fq_t u, v, vv, vvv, R_val, A, t1, t2;
 
-    // U1 = X1 (already in correct form since we're doing P + Q where Q.z = 1)
-    // U2 = X2 * Z1
-    fq_mul(&t1, &q->x, &p->z);    // t1 = U2 = X2 * Z1
+    // u = Y2*Z1 - Y1 (since Z2=1)
+    fq_mul(&t1, &q->y, &p->z);       // t1 = Y2*Z1
+    fq_sub(&u, &t1, &p->y);          // u = Y2*Z1 - Y1
 
-    // S1 = Y1
-    // S2 = Y2 * Z1
-    fq_mul(&t2, &q->y, &p->z);    // t2 = S2 = Y2 * Z1
+    // v = X2*Z1 - X1 (since Z2=1)
+    fq_mul(&t1, &q->x, &p->z);       // t1 = X2*Z1
+    fq_sub(&v, &t1, &p->x);          // v = X2*Z1 - X1
 
-    // H = U2 - U1 = X2*Z1 - X1
-    fq_sub(&H, &t1, &p->x);
-
-    // R = S2 - S1 = Y2*Z1 - Y1
-    fq_sub(&R, &t2, &p->y);
-
-    // Check if points are the same
-    if (fq_is_zero(&H) && fq_is_zero(&R)) {
-        // Need to double p
+    // Check if points are the same (v=0 and u=0 -> doubling case)
+    if (fq_is_zero(&v) && fq_is_zero(&u)) {
         point_double(result, p);
         return;
     }
 
-    // Check if points are negatives
-    if (fq_is_zero(&H)) {
+    // Check if points are negatives (v=0 and u!=0 -> identity)
+    if (fq_is_zero(&v)) {
         point_set_identity_projective(result);
         return;
     }
 
-    // HH = H^2
-    fq_sqr(&HH, &H);
-    // HHH = H * HH
-    fq_mul(&HHH, &H, &HH);
-    // V = X1 * HH
-    fq_mul(&V, &p->x, &HH);
+    // vv = v^2
+    fq_sqr(&vv, &v);
+    // vvv = v^3
+    fq_mul(&vvv, &v, &vv);
+    // R_val = vv * X1 (since Z2=1, X1*Z2 = X1)
+    fq_mul(&R_val, &vv, &p->x);
 
-    // X3 = R^2 - HHH - 2*V
-    fq_sqr(&t1, &R);
-    fq_sub(&t1, &t1, &HHH);
-    fq_add(&t2, &V, &V);
-    fq_sub(&result->x, &t1, &t2);
+    // A = u^2 * Z1 - vvv - 2*R_val (since Z1*Z2 = Z1)
+    fq_sqr(&t1, &u);                 // t1 = u^2
+    fq_mul(&A, &t1, &p->z);          // A = u^2 * Z1
+    fq_sub(&A, &A, &vvv);            // A = u^2*Z1 - vvv
+    fq_add(&t1, &R_val, &R_val);     // t1 = 2*R_val
+    fq_sub(&A, &A, &t1);             // A = u^2*Z1 - vvv - 2*R_val
 
-    // Y3 = R * (V - X3) - Y1 * HHH
-    fq_sub(&t1, &V, &result->x);
-    fq_mul(&t1, &R, &t1);
-    fq_mul(&t2, &p->y, &HHH);
-    fq_sub(&result->y, &t1, &t2);
+    // X3 = v * A
+    fq_mul(&result->x, &v, &A);
 
-    // Z3 = Z1 * H
-    fq_mul(&result->z, &p->z, &H);
+    // Y3 = u * (R_val - A) - vvv * Y1 (since Z2=1, Y1*Z2 = Y1)
+    fq_sub(&t1, &R_val, &A);         // t1 = R_val - A
+    fq_mul(&t1, &u, &t1);            // t1 = u * (R_val - A)
+    fq_mul(&t2, &vvv, &p->y);        // t2 = vvv * Y1
+    fq_sub(&result->y, &t1, &t2);    // Y3 = u*(R_val-A) - vvv*Y1
+
+    // Z3 = vvv * Z1 (since Z1*Z2 = Z1)
+    fq_mul(&result->z, &vvv, &p->z);
 }
 
 // ============================================================================

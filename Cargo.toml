@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["Raham"]
 description = "GPU-accelerated MSM for Pallas curve (for Nova IVC)"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/raham/pallas-gpu"
+repository = "https://github.com/raham24/pallas-gpu"
 keywords = ["cryptography", "elliptic-curves", "gpu", "cuda", "pallas"]
 categories = ["cryptography", "mathematics"]
 

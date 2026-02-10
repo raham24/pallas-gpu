@@ -1,3 +1,8 @@
+// MAKE NOVA WORK WITH EXSISTING CODE
+// PLAY WITH BATCH SIZES
+// different versions of gpu arch and compare with current arch - how good is the performance
+// work more on the writing
+
 // Include all CUDA implementations in one compilation unit
 #include "pallas_field.cu"
 #include "pallas_curve.cu"
@@ -309,6 +314,31 @@ __global__ void msm_serial_kernel(
     }
 }
 
+// ============================================================================
+// Montgomery conversion kernels (for standard ↔ Montgomery form)
+// ============================================================================
+
+// Convert input points from standard form to Montgomery form
+__global__ void convert_points_to_montgomery_kernel(
+    affine_point_t* points,
+    int num_points
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_points) return;
+    fq_to_montgomery(&points[idx].x, &points[idx].x);
+    fq_to_montgomery(&points[idx].y, &points[idx].y);
+}
+
+// Convert result from Montgomery form to standard form
+__global__ void convert_result_from_montgomery_kernel(
+    projective_point_t* result
+) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    fq_from_montgomery(&result->x, &result->x);
+    fq_from_montgomery(&result->y, &result->y);
+    fq_from_montgomery(&result->z, &result->z);
+}
+
 } // namespace pallas
 
 // ============================================================================
@@ -388,7 +418,17 @@ cudaError_t pallas_msm_gpu(
         cudaMemcpy(d_points, h_points, points_size, cudaMemcpyHostToDevice);
         cudaMemcpy(d_scalars, h_scalars, scalars_size, cudaMemcpyHostToDevice);
 
+        // Convert points from standard form to Montgomery form
+        {
+            int threads = 256;
+            int blocks = ((int)num_points + threads - 1) / threads;
+            pallas::convert_points_to_montgomery_kernel<<<blocks, threads>>>(d_points, num_points);
+        }
+
         pallas::msm_serial_kernel<<<1, 1>>>(d_points, d_scalars, d_result, num_points);
+
+        // Convert result from Montgomery form to standard form
+        pallas::convert_result_from_montgomery_kernel<<<1, 1>>>(d_result);
 
         cudaDeviceSynchronize();
         cudaMemcpy(h_result, d_result, sizeof(pallas::projective_point_t), cudaMemcpyDeviceToHost);
@@ -448,6 +488,15 @@ cudaError_t pallas_msm_gpu(
     err = cudaMemcpy(d_scalars, h_scalars, scalars_size, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) goto cleanup;
 
+    // Convert points from standard form to Montgomery form
+    {
+        int conv_threads = 256;
+        int conv_blocks = ((int)num_points + conv_threads - 1) / conv_threads;
+        pallas::convert_points_to_montgomery_kernel<<<conv_blocks, conv_threads>>>(d_points, num_points);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto cleanup;
+    }
+
     // Phase 1: Accumulate into buckets
     {
         dim3 grid(num_chunks, MSM_NUM_WINDOWS);
@@ -471,6 +520,12 @@ cudaError_t pallas_msm_gpu(
 
     // Phase 3: Combine windows
     pallas::msm_combine_windows_kernel<<<1, 1>>>(d_result, d_window_sums, MSM_NUM_WINDOWS);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) goto cleanup;
+
+    // Convert result from Montgomery form to standard form
+    pallas::convert_result_from_montgomery_kernel<<<1, 1>>>(d_result);
 
     err = cudaGetLastError();
     if (err != cudaSuccess) goto cleanup;
