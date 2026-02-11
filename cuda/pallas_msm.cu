@@ -4,6 +4,7 @@
 #include "pallas_field.cu"
 #include "pallas_curve.cu"
 #include <stdio.h>
+#include <pthread.h>
 
 namespace pallas {
 
@@ -271,6 +272,8 @@ __global__ void convert_result_from_montgomery_kernel(
 
 extern "C" {
 
+static pthread_mutex_t g_msm_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static bool g_device_selected = false;
 static int g_selected_device = 0;
 
@@ -360,11 +363,14 @@ cudaError_t pallas_msm_gpu(
     pallas::projective_point_t* h_result,
     size_t num_points
 ) {
+    pthread_mutex_lock(&g_msm_mutex);
+
     select_best_gpu();
 
     if (num_points == 0) {
         memset(h_result, 0, sizeof(pallas::projective_point_t));
         h_result->y.limbs[0] = 1;  // Identity: (0:1:0)
+        pthread_mutex_unlock(&g_msm_mutex);
         return cudaSuccess;
     }
 
@@ -402,91 +408,95 @@ cudaError_t pallas_msm_gpu(
         cudaFree(d_scalars);
         cudaFree(d_result);
 
-        return cudaGetLastError();
+        err = cudaGetLastError();
+        goto done;
     }
 
     // ====================================================================
     // Parallel Pippenger MSM
     // ====================================================================
-
-    // Adaptive chunk size: larger chunks = fewer chunks = less reduce work + memory
-    int points_per_chunk;
-    if ((int)num_points <= (1 << 14))       points_per_chunk = 4096;
-    else if ((int)num_points <= (1 << 18))  points_per_chunk = 16384;
-    else                                     points_per_chunk = 32768;
-
-    int num_chunks = ((int)num_points + points_per_chunk - 1) / points_per_chunk;
-
-    size_t points_size = num_points * sizeof(pallas::affine_point_t);
-    size_t scalars_size = num_points * pallas::LIMBS * sizeof(uint32_t);
-    size_t chunk_buckets_size = (size_t)num_chunks * MSM_NUM_WINDOWS * MSM_NUM_BUCKETS
-                                * sizeof(pallas::projective_point_t);
-
-    // Ensure persistent device memory is large enough
-    ensure_device_memory(num_points, chunk_buckets_size);
-
-    // Copy inputs to device
-    err = cudaMemcpy(g_d_points, h_points, points_size, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) return err;
-
-    err = cudaMemcpy(g_d_scalars, h_scalars, scalars_size, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) return err;
-
-    // Convert points from standard form to Montgomery form
     {
-        int conv_threads = 256;
-        int conv_blocks = ((int)num_points + conv_threads - 1) / conv_threads;
-        pallas::convert_points_to_montgomery_kernel<<<conv_blocks, conv_threads>>>(
-            g_d_points, (int)num_points
+        // Adaptive chunk size: larger chunks = fewer chunks = less reduce work + memory
+        int points_per_chunk;
+        if ((int)num_points <= (1 << 14))       points_per_chunk = 4096;
+        else if ((int)num_points <= (1 << 18))  points_per_chunk = 16384;
+        else                                     points_per_chunk = 32768;
+
+        int num_chunks = ((int)num_points + points_per_chunk - 1) / points_per_chunk;
+
+        size_t points_size = num_points * sizeof(pallas::affine_point_t);
+        size_t scalars_size = num_points * pallas::LIMBS * sizeof(uint32_t);
+        size_t chunk_buckets_size = (size_t)num_chunks * MSM_NUM_WINDOWS * MSM_NUM_BUCKETS
+                                    * sizeof(pallas::projective_point_t);
+
+        // Ensure persistent device memory is large enough
+        ensure_device_memory(num_points, chunk_buckets_size);
+
+        // Copy inputs to device
+        err = cudaMemcpy(g_d_points, h_points, points_size, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) goto done;
+
+        err = cudaMemcpy(g_d_scalars, h_scalars, scalars_size, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) goto done;
+
+        // Convert points from standard form to Montgomery form
+        {
+            int conv_threads = 256;
+            int conv_blocks = ((int)num_points + conv_threads - 1) / conv_threads;
+            pallas::convert_points_to_montgomery_kernel<<<conv_blocks, conv_threads>>>(
+                g_d_points, (int)num_points
+            );
+            err = cudaGetLastError();
+            if (err != cudaSuccess) goto done;
+        }
+
+        // Phase 1: Accumulate into per-chunk shared-memory buckets
+        {
+            dim3 grid(num_chunks, MSM_NUM_WINDOWS);
+            pallas::msm_bucket_acc_smem_kernel<<<grid, THREADS_PER_BLOCK>>>(
+                g_d_chunk_buckets, g_d_points, g_d_scalars,
+                (int)num_points, points_per_chunk
+            );
+            err = cudaGetLastError();
+            if (err != cudaSuccess) goto done;
+        }
+
+        // Phase 2: Reduce per-chunk buckets to global buckets
+        pallas::msm_reduce_chunks_kernel<<<MSM_NUM_WINDOWS, THREADS_PER_BLOCK>>>(
+            g_d_buckets, g_d_chunk_buckets, num_chunks, MSM_NUM_WINDOWS
         );
         err = cudaGetLastError();
-        if (err != cudaSuccess) return err;
-    }
+        if (err != cudaSuccess) goto done;
 
-    // Phase 1: Accumulate into per-chunk shared-memory buckets
-    {
-        dim3 grid(num_chunks, MSM_NUM_WINDOWS);
-        pallas::msm_bucket_acc_smem_kernel<<<grid, THREADS_PER_BLOCK>>>(
-            g_d_chunk_buckets, g_d_points, g_d_scalars,
-            (int)num_points, points_per_chunk
+        // Phase 3: Summation by parts (bucket reduction)
+        pallas::msm_bucket_reduce_kernel<<<MSM_NUM_WINDOWS, 1>>>(
+            g_d_window_sums, g_d_buckets, MSM_NUM_WINDOWS
         );
         err = cudaGetLastError();
-        if (err != cudaSuccess) return err;
+        if (err != cudaSuccess) goto done;
+
+        // Phase 4: Combine windows
+        pallas::msm_combine_windows_kernel<<<1, 1>>>(
+            g_d_result, g_d_window_sums, MSM_NUM_WINDOWS
+        );
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto done;
+
+        // Convert result from Montgomery form to standard form
+        pallas::convert_result_from_montgomery_kernel<<<1, 1>>>(g_d_result);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto done;
+
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) goto done;
+
+        // Copy result back
+        err = cudaMemcpy(h_result, g_d_result, sizeof(pallas::projective_point_t),
+                         cudaMemcpyDeviceToHost);
     }
 
-    // Phase 2: Reduce per-chunk buckets to global buckets
-    pallas::msm_reduce_chunks_kernel<<<MSM_NUM_WINDOWS, THREADS_PER_BLOCK>>>(
-        g_d_buckets, g_d_chunk_buckets, num_chunks, MSM_NUM_WINDOWS
-    );
-    err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
-
-    // Phase 3: Summation by parts (bucket reduction)
-    pallas::msm_bucket_reduce_kernel<<<MSM_NUM_WINDOWS, 1>>>(
-        g_d_window_sums, g_d_buckets, MSM_NUM_WINDOWS
-    );
-    err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
-
-    // Phase 4: Combine windows
-    pallas::msm_combine_windows_kernel<<<1, 1>>>(
-        g_d_result, g_d_window_sums, MSM_NUM_WINDOWS
-    );
-    err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
-
-    // Convert result from Montgomery form to standard form
-    pallas::convert_result_from_montgomery_kernel<<<1, 1>>>(g_d_result);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
-
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) return err;
-
-    // Copy result back
-    err = cudaMemcpy(h_result, g_d_result, sizeof(pallas::projective_point_t),
-                     cudaMemcpyDeviceToHost);
-
+done:
+    pthread_mutex_unlock(&g_msm_mutex);
     return err;
 }
 
