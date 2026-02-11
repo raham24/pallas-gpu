@@ -1,9 +1,6 @@
-// MAKE NOVA WORK WITH EXSISTING CODE
-// PLAY WITH BATCH SIZES
-// different versions of gpu arch and compare with current arch - how good is the performance
-// work more on the writing
+// GPU-accelerated Pippenger MSM for Pallas curve
+// Uses shared-memory bucket accumulation with per-block local buckets
 
-// Include all CUDA implementations in one compilation unit
 #include "pallas_field.cu"
 #include "pallas_curve.cu"
 #include <stdio.h>
@@ -19,7 +16,6 @@ namespace pallas {
 #define MSM_NUM_WINDOWS ((256 + MSM_WINDOW_SIZE - 1) / MSM_WINDOW_SIZE)  // 32
 
 #define THREADS_PER_BLOCK 256
-#define POINTS_PER_CHUNK 4096  // Points processed per block
 
 // ============================================================================
 // Helper: Extract window from scalar
@@ -42,73 +38,95 @@ __device__ __forceinline__ uint32_t get_window(const uint32_t* scalar, int start
 }
 
 // ============================================================================
-// Atomic bucket addition using spin-lock
+// Phase 1: Shared-memory bucket accumulation
 // ============================================================================
+// Grid: (num_chunks, MSM_NUM_WINDOWS)
+// Each block accumulates one chunk of points for one window into shared memory,
+// then writes to per-chunk global memory. Shared-memory spin-locks give L1-speed
+// atomics with contention limited to 256 threads over 255 buckets (~1 per bucket).
 
-__device__ void atomic_bucket_add(
-    projective_point_t* bucket,
-    int* lock,
-    const affine_point_t* point
-) {
-    // Acquire lock (spin)
-    while (atomicCAS(lock, 0, 1) != 0) {
-        // Spin - could add __nanosleep for less contention
-    }
-    __threadfence();  // Ensure we see latest bucket value
-
-    // Critical section
-    point_add_mixed(bucket, bucket, point);
-
-    __threadfence();  // Ensure write is visible
-    atomicExch(lock, 0);  // Release lock
-}
-
-// ============================================================================
-// Phase 1: Parallel bucket accumulation with atomic locks
-// ============================================================================
-// Grid: (num_chunks, num_windows)
-// Each block processes one chunk of points for one window
-
-__global__ void msm_accumulate_atomic_kernel(
-    projective_point_t* g_buckets,    // [num_windows * num_buckets]
-    int* g_locks,                      // [num_windows * num_buckets]
+__global__ void msm_bucket_acc_smem_kernel(
+    projective_point_t* chunk_buckets,  // [num_chunks * MSM_NUM_WINDOWS * MSM_NUM_BUCKETS]
     const affine_point_t* points,
     const uint32_t* scalars,
-    int num_points
+    int num_points,
+    int points_per_chunk
 ) {
+    __shared__ projective_point_t s_buckets[MSM_NUM_BUCKETS];  // 255 * 96 = ~24.5 KB
+    __shared__ int s_locks[MSM_NUM_BUCKETS];                   // 255 * 4  = ~1 KB
+
     int chunk_idx = blockIdx.x;
     int window_idx = blockIdx.y;
     int tid = threadIdx.x;
 
-    int chunk_start = chunk_idx * POINTS_PER_CHUNK;
-    int chunk_end = min(chunk_start + POINTS_PER_CHUNK, num_points);
+    // Initialize shared memory buckets and locks
+    for (int b = tid; b < MSM_NUM_BUCKETS; b += blockDim.x) {
+        point_set_identity_projective(&s_buckets[b]);
+        s_locks[b] = 0;
+    }
+    __syncthreads();
 
-    if (chunk_start >= num_points) return;
-
+    int chunk_start = chunk_idx * points_per_chunk;
+    int chunk_end = min(chunk_start + points_per_chunk, num_points);
     int start_bit = window_idx * MSM_WINDOW_SIZE;
-    int bucket_base = window_idx * MSM_NUM_BUCKETS;
 
-    // Each thread processes multiple points with striding
+    // Each thread processes its stride of points
     for (int i = chunk_start + tid; i < chunk_end; i += blockDim.x) {
-        const affine_point_t* point = &points[i];
+        const affine_point_t* pt = &points[i];
+        if (point_is_identity_affine(pt)) continue;
 
-        // Skip identity
-        if (point_is_identity_affine(point)) continue;
+        uint32_t wv = get_window(&scalars[i * LIMBS], start_bit);
+        if (wv == 0) continue;
 
-        const uint32_t* scalar = &scalars[i * LIMBS];
-        uint32_t window_val = get_window(scalar, start_bit);
+        int bi = wv - 1;
 
-        if (window_val == 0) continue;
+        // Acquire shared-memory spin-lock (L1 latency, ~10x faster than global)
+        while (atomicCAS(&s_locks[bi], 0, 1) != 0) {}
+        __threadfence_block();  // Acquire fence: ensure we see previous writer's updates
+        point_add_mixed(&s_buckets[bi], &s_buckets[bi], pt);
+        __threadfence_block();  // Release fence: ensure our updates are visible
+        atomicExch(&s_locks[bi], 0);
+    }
+    __syncthreads();
 
-        int bucket_idx = bucket_base + (window_val - 1);
-
-        // Atomic add to global bucket
-        atomic_bucket_add(&g_buckets[bucket_idx], &g_locks[bucket_idx], point);
+    // Write shared buckets to per-chunk global memory
+    int num_windows = gridDim.y;
+    int out_base = (chunk_idx * num_windows + window_idx) * MSM_NUM_BUCKETS;
+    for (int b = tid; b < MSM_NUM_BUCKETS; b += blockDim.x) {
+        chunk_buckets[out_base + b] = s_buckets[b];
     }
 }
 
 // ============================================================================
-// Phase 2: Bucket reduction (summation by parts)
+// Phase 2: Reduce per-chunk buckets across all chunks
+// ============================================================================
+// Grid: (MSM_NUM_WINDOWS), Block: (THREADS_PER_BLOCK)
+// Each thread handles one bucket index, sums across all chunks
+
+__global__ void msm_reduce_chunks_kernel(
+    projective_point_t* buckets,              // [MSM_NUM_WINDOWS * MSM_NUM_BUCKETS]
+    const projective_point_t* chunk_buckets,  // [num_chunks * MSM_NUM_WINDOWS * MSM_NUM_BUCKETS]
+    int num_chunks,
+    int num_windows
+) {
+    int window_idx = blockIdx.x;
+    int bucket_idx = threadIdx.x;
+
+    if (window_idx >= num_windows || bucket_idx >= MSM_NUM_BUCKETS) return;
+
+    projective_point_t sum;
+    point_set_identity_projective(&sum);
+
+    for (int c = 0; c < num_chunks; c++) {
+        int offset = (c * num_windows + window_idx) * MSM_NUM_BUCKETS + bucket_idx;
+        point_add(&sum, &sum, &chunk_buckets[offset]);
+    }
+
+    buckets[window_idx * MSM_NUM_BUCKETS + bucket_idx] = sum;
+}
+
+// ============================================================================
+// Phase 3: Bucket reduction (summation by parts)
 // ============================================================================
 // One block per window, reduces 255 buckets to one window sum
 
@@ -139,7 +157,7 @@ __global__ void msm_bucket_reduce_kernel(
 }
 
 // ============================================================================
-// Phase 3: Combine windows
+// Phase 4: Combine windows
 // ============================================================================
 
 __global__ void msm_combine_windows_kernel(
@@ -154,7 +172,6 @@ __global__ void msm_combine_windows_kernel(
 
     // High to low windows
     for (int w = num_windows - 1; w >= 0; w--) {
-        // Double by window_size bits
         for (int d = 0; d < MSM_WINDOW_SIZE; d++) {
             point_double(&acc, &acc);
         }
@@ -162,97 +179,6 @@ __global__ void msm_combine_windows_kernel(
     }
 
     point_copy_projective(result, &acc);
-}
-
-// ============================================================================
-// Alternative: Chunk-local accumulation (no atomics, uses more memory)
-// ============================================================================
-// Each block accumulates into its own local buckets, then we reduce
-
-__global__ void msm_chunk_local_kernel(
-    projective_point_t* chunk_buckets,   // [num_chunks * num_windows * num_buckets]
-    const affine_point_t* points,
-    const uint32_t* scalars,
-    int num_points,
-    int num_chunks
-) {
-    int chunk_idx = blockIdx.x;
-    int window_idx = blockIdx.y;
-    int tid = threadIdx.x;
-
-    // Shared memory for this chunk's buckets
-    __shared__ projective_point_t s_buckets[MSM_NUM_BUCKETS];
-
-    // Initialize shared buckets
-    for (int b = tid; b < MSM_NUM_BUCKETS; b += blockDim.x) {
-        point_set_identity_projective(&s_buckets[b]);
-    }
-    __syncthreads();
-
-    int chunk_start = chunk_idx * POINTS_PER_CHUNK;
-    int chunk_end = min(chunk_start + POINTS_PER_CHUNK, num_points);
-    int start_bit = window_idx * MSM_WINDOW_SIZE;
-
-    // Process points - threads take turns to avoid races
-    // Batch points for better efficiency
-    #define BATCH_SIZE 32
-
-    for (int batch_start = chunk_start; batch_start < chunk_end; batch_start += BATCH_SIZE) {
-        int batch_end = min(batch_start + BATCH_SIZE, chunk_end);
-
-        // Each iteration, one thread from each warp does work
-        for (int t = 0; t < BATCH_SIZE && batch_start + t < chunk_end; t++) {
-            int i = batch_start + t;
-            int responsible_thread = t % blockDim.x;
-
-            if (tid == responsible_thread) {
-                const affine_point_t* point = &points[i];
-                if (!point_is_identity_affine(point)) {
-                    const uint32_t* scalar = &scalars[i * LIMBS];
-                    uint32_t window_val = get_window(scalar, start_bit);
-
-                    if (window_val > 0) {
-                        int bucket_idx = window_val - 1;
-                        point_add_mixed(&s_buckets[bucket_idx], &s_buckets[bucket_idx], point);
-                    }
-                }
-            }
-            __syncthreads();
-        }
-    }
-
-    #undef BATCH_SIZE
-    __syncthreads();
-
-    // Write to global chunk buckets
-    int out_offset = (chunk_idx * MSM_NUM_WINDOWS + window_idx) * MSM_NUM_BUCKETS;
-    for (int b = tid; b < MSM_NUM_BUCKETS; b += blockDim.x) {
-        point_copy_projective(&chunk_buckets[out_offset + b], &s_buckets[b]);
-    }
-}
-
-// Reduce chunk buckets across all chunks
-__global__ void msm_reduce_chunks_kernel(
-    projective_point_t* buckets,         // [num_windows * num_buckets]
-    const projective_point_t* chunk_buckets,  // [num_chunks * num_windows * num_buckets]
-    int num_chunks,
-    int num_windows
-) {
-    int window_idx = blockIdx.x;
-    int bucket_idx = threadIdx.x;
-
-    if (window_idx >= num_windows || bucket_idx >= MSM_NUM_BUCKETS) return;
-
-    projective_point_t sum;
-    point_set_identity_projective(&sum);
-
-    // Sum across all chunks
-    for (int c = 0; c < num_chunks; c++) {
-        int offset = (c * num_windows + window_idx) * MSM_NUM_BUCKETS + bucket_idx;
-        point_add(&sum, &sum, &chunk_buckets[offset]);
-    }
-
-    buckets[window_idx * MSM_NUM_BUCKETS + bucket_idx] = sum;
 }
 
 // ============================================================================
@@ -315,10 +241,9 @@ __global__ void msm_serial_kernel(
 }
 
 // ============================================================================
-// Montgomery conversion kernels (for standard ↔ Montgomery form)
+// Montgomery conversion kernels (for standard <-> Montgomery form)
 // ============================================================================
 
-// Convert input points from standard form to Montgomery form
 __global__ void convert_points_to_montgomery_kernel(
     affine_point_t* points,
     int num_points
@@ -329,7 +254,6 @@ __global__ void convert_points_to_montgomery_kernel(
     fq_to_montgomery(&points[idx].y, &points[idx].y);
 }
 
-// Convert result from Montgomery form to standard form
 __global__ void convert_result_from_montgomery_kernel(
     projective_point_t* result
 ) {
@@ -385,7 +309,51 @@ void select_best_gpu() {
     g_device_selected = true;
 }
 
+// ============================================================================
+// Persistent GPU memory pool (avoids cudaMalloc/cudaFree per call)
+// ============================================================================
+
+static pallas::affine_point_t*      g_d_points = nullptr;
+static uint32_t*                    g_d_scalars = nullptr;
+static pallas::projective_point_t*  g_d_chunk_buckets = nullptr;
+static pallas::projective_point_t*  g_d_buckets = nullptr;
+static pallas::projective_point_t*  g_d_window_sums = nullptr;
+static pallas::projective_point_t*  g_d_result = nullptr;
+
+static size_t g_cap_points = 0;        // current capacity in number of points
+static size_t g_cap_chunk_buckets = 0;  // current capacity in bytes
+
+static void ensure_device_memory(size_t num_points, size_t chunk_buckets_bytes) {
+    // Reallocate points and scalars if needed
+    if (num_points > g_cap_points) {
+        if (g_d_points)  cudaFree(g_d_points);
+        if (g_d_scalars) cudaFree(g_d_scalars);
+        cudaMalloc(&g_d_points,  num_points * sizeof(pallas::affine_point_t));
+        cudaMalloc(&g_d_scalars, num_points * pallas::LIMBS * sizeof(uint32_t));
+        g_cap_points = num_points;
+    }
+
+    // Reallocate chunk_buckets if needed
+    if (chunk_buckets_bytes > g_cap_chunk_buckets) {
+        if (g_d_chunk_buckets) cudaFree(g_d_chunk_buckets);
+        cudaMalloc(&g_d_chunk_buckets, chunk_buckets_bytes);
+        g_cap_chunk_buckets = chunk_buckets_bytes;
+    }
+
+    // These are fixed-size, allocate once
+    if (!g_d_buckets) {
+        size_t buckets_size = MSM_NUM_WINDOWS * MSM_NUM_BUCKETS * sizeof(pallas::projective_point_t);
+        size_t window_sums_size = MSM_NUM_WINDOWS * sizeof(pallas::projective_point_t);
+        cudaMalloc(&g_d_buckets, buckets_size);
+        cudaMalloc(&g_d_window_sums, window_sums_size);
+        cudaMalloc(&g_d_result, sizeof(pallas::projective_point_t));
+    }
+}
+
+// ============================================================================
 // Main MSM entry point
+// ============================================================================
+
 cudaError_t pallas_msm_gpu(
     const pallas::affine_point_t* h_points,
     const uint32_t* h_scalars,
@@ -418,7 +386,6 @@ cudaError_t pallas_msm_gpu(
         cudaMemcpy(d_points, h_points, points_size, cudaMemcpyHostToDevice);
         cudaMemcpy(d_scalars, h_scalars, scalars_size, cudaMemcpyHostToDevice);
 
-        // Convert points from standard form to Montgomery form
         {
             int threads = 256;
             int blocks = ((int)num_points + threads - 1) / threads;
@@ -426,8 +393,6 @@ cudaError_t pallas_msm_gpu(
         }
 
         pallas::msm_serial_kernel<<<1, 1>>>(d_points, d_scalars, d_result, num_points);
-
-        // Convert result from Montgomery form to standard form
         pallas::convert_result_from_montgomery_kernel<<<1, 1>>>(d_result);
 
         cudaDeviceSynchronize();
@@ -440,109 +405,87 @@ cudaError_t pallas_msm_gpu(
         return cudaGetLastError();
     }
 
-    // Parallel implementation for larger inputs
+    // ====================================================================
+    // Parallel Pippenger MSM
+    // ====================================================================
 
-    // Calculate grid dimensions
-    int num_chunks = (num_points + POINTS_PER_CHUNK - 1) / POINTS_PER_CHUNK;
+    // Adaptive chunk size: larger chunks = fewer chunks = less reduce work + memory
+    int points_per_chunk;
+    if ((int)num_points <= (1 << 14))       points_per_chunk = 4096;
+    else if ((int)num_points <= (1 << 18))  points_per_chunk = 16384;
+    else                                     points_per_chunk = 32768;
 
-    // Device allocations
-    pallas::affine_point_t* d_points = nullptr;
-    uint32_t* d_scalars = nullptr;
-    pallas::projective_point_t* d_buckets = nullptr;
-    pallas::projective_point_t* d_window_sums = nullptr;
-    pallas::projective_point_t* d_result = nullptr;
-    int* d_locks = nullptr;
+    int num_chunks = ((int)num_points + points_per_chunk - 1) / points_per_chunk;
 
     size_t points_size = num_points * sizeof(pallas::affine_point_t);
     size_t scalars_size = num_points * pallas::LIMBS * sizeof(uint32_t);
-    size_t buckets_size = MSM_NUM_WINDOWS * MSM_NUM_BUCKETS * sizeof(pallas::projective_point_t);
-    size_t locks_size = MSM_NUM_WINDOWS * MSM_NUM_BUCKETS * sizeof(int);
-    size_t window_sums_size = MSM_NUM_WINDOWS * sizeof(pallas::projective_point_t);
+    size_t chunk_buckets_size = (size_t)num_chunks * MSM_NUM_WINDOWS * MSM_NUM_BUCKETS
+                                * sizeof(pallas::projective_point_t);
 
-    err = cudaMalloc(&d_points, points_size);
-    if (err != cudaSuccess) goto cleanup;
+    // Ensure persistent device memory is large enough
+    ensure_device_memory(num_points, chunk_buckets_size);
 
-    err = cudaMalloc(&d_scalars, scalars_size);
-    if (err != cudaSuccess) goto cleanup;
+    // Copy inputs to device
+    err = cudaMemcpy(g_d_points, h_points, points_size, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return err;
 
-    err = cudaMalloc(&d_buckets, buckets_size);
-    if (err != cudaSuccess) goto cleanup;
-
-    err = cudaMalloc(&d_locks, locks_size);
-    if (err != cudaSuccess) goto cleanup;
-
-    err = cudaMalloc(&d_window_sums, window_sums_size);
-    if (err != cudaSuccess) goto cleanup;
-
-    err = cudaMalloc(&d_result, sizeof(pallas::projective_point_t));
-    if (err != cudaSuccess) goto cleanup;
-
-    // Initialize buckets and locks to zero
-    cudaMemset(d_buckets, 0, buckets_size);
-    cudaMemset(d_locks, 0, locks_size);
-
-    // Copy inputs
-    err = cudaMemcpy(d_points, h_points, points_size, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) goto cleanup;
-
-    err = cudaMemcpy(d_scalars, h_scalars, scalars_size, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) goto cleanup;
+    err = cudaMemcpy(g_d_scalars, h_scalars, scalars_size, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return err;
 
     // Convert points from standard form to Montgomery form
     {
         int conv_threads = 256;
         int conv_blocks = ((int)num_points + conv_threads - 1) / conv_threads;
-        pallas::convert_points_to_montgomery_kernel<<<conv_blocks, conv_threads>>>(d_points, num_points);
+        pallas::convert_points_to_montgomery_kernel<<<conv_blocks, conv_threads>>>(
+            g_d_points, (int)num_points
+        );
         err = cudaGetLastError();
-        if (err != cudaSuccess) goto cleanup;
+        if (err != cudaSuccess) return err;
     }
 
-    // Phase 1: Accumulate into buckets
+    // Phase 1: Accumulate into per-chunk shared-memory buckets
     {
         dim3 grid(num_chunks, MSM_NUM_WINDOWS);
-        dim3 block(THREADS_PER_BLOCK);
-
-        pallas::msm_accumulate_atomic_kernel<<<grid, block>>>(
-            d_buckets, d_locks, d_points, d_scalars, num_points
+        pallas::msm_bucket_acc_smem_kernel<<<grid, THREADS_PER_BLOCK>>>(
+            g_d_chunk_buckets, g_d_points, g_d_scalars,
+            (int)num_points, points_per_chunk
         );
+        err = cudaGetLastError();
+        if (err != cudaSuccess) return err;
     }
 
-    err = cudaGetLastError();
-    if (err != cudaSuccess) goto cleanup;
-
-    // Phase 2: Reduce buckets to window sums
-    pallas::msm_bucket_reduce_kernel<<<MSM_NUM_WINDOWS, 1>>>(
-        d_window_sums, d_buckets, MSM_NUM_WINDOWS
+    // Phase 2: Reduce per-chunk buckets to global buckets
+    pallas::msm_reduce_chunks_kernel<<<MSM_NUM_WINDOWS, THREADS_PER_BLOCK>>>(
+        g_d_buckets, g_d_chunk_buckets, num_chunks, MSM_NUM_WINDOWS
     );
-
     err = cudaGetLastError();
-    if (err != cudaSuccess) goto cleanup;
+    if (err != cudaSuccess) return err;
 
-    // Phase 3: Combine windows
-    pallas::msm_combine_windows_kernel<<<1, 1>>>(d_result, d_window_sums, MSM_NUM_WINDOWS);
-
+    // Phase 3: Summation by parts (bucket reduction)
+    pallas::msm_bucket_reduce_kernel<<<MSM_NUM_WINDOWS, 1>>>(
+        g_d_window_sums, g_d_buckets, MSM_NUM_WINDOWS
+    );
     err = cudaGetLastError();
-    if (err != cudaSuccess) goto cleanup;
+    if (err != cudaSuccess) return err;
+
+    // Phase 4: Combine windows
+    pallas::msm_combine_windows_kernel<<<1, 1>>>(
+        g_d_result, g_d_window_sums, MSM_NUM_WINDOWS
+    );
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
 
     // Convert result from Montgomery form to standard form
-    pallas::convert_result_from_montgomery_kernel<<<1, 1>>>(d_result);
-
+    pallas::convert_result_from_montgomery_kernel<<<1, 1>>>(g_d_result);
     err = cudaGetLastError();
-    if (err != cudaSuccess) goto cleanup;
+    if (err != cudaSuccess) return err;
 
     err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) goto cleanup;
+    if (err != cudaSuccess) return err;
 
-    // Copy result
-    err = cudaMemcpy(h_result, d_result, sizeof(pallas::projective_point_t), cudaMemcpyDeviceToHost);
-
-cleanup:
-    if (d_points) cudaFree(d_points);
-    if (d_scalars) cudaFree(d_scalars);
-    if (d_buckets) cudaFree(d_buckets);
-    if (d_locks) cudaFree(d_locks);
-    if (d_window_sums) cudaFree(d_window_sums);
-    if (d_result) cudaFree(d_result);
+    // Copy result back
+    err = cudaMemcpy(h_result, g_d_result, sizeof(pallas::projective_point_t),
+                     cudaMemcpyDeviceToHost);
 
     return err;
 }

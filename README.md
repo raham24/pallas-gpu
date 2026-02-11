@@ -11,7 +11,9 @@ This library provides a CUDA implementation of MSM for the Pallas curve using Pi
 - **Pippenger's algorithm**: O(n / log n) MSM with 8-bit window decomposition
 - **Montgomery field arithmetic**: CIOS multiplication with 8x32-bit limbs
 - **Homogeneous projective coordinates**: Consistent EFD add-1998-cmo-2 formulas across all point operations
-- **Parallel bucket accumulation**: Multi-block GPU parallelism with per-bucket atomic locks
+- **Shared-memory bucket accumulation**: Per-block shared-memory buckets with spinlock synchronization, ~10x faster than global memory atomics
+- **Adaptive chunking**: Chunk size scales with input (4K/16K/32K) to balance parallelism and memory
+- **Persistent GPU memory pool**: Static device allocations avoid cudaMalloc/cudaFree overhead across calls
 - **Automatic Montgomery conversion**: Points enter in standard form, GPU handles Montgomery conversion internally
 
 ## Architecture
@@ -20,9 +22,11 @@ This library provides a CUDA implementation of MSM for the Pallas curve using Pi
 ┌─────────────────────────────────────────────────────────────┐
 │  Pippenger MSM (pallas_msm.cu)                              │
 │  ├── Window decomposition (8-bit, 32 windows)               │
-│  ├── Parallel bucket accumulation (atomic locks)            │
+│  ├── Shared-memory bucket accumulation (spinlocks)          │
+│  ├── Cross-chunk bucket reduction                           │
 │  ├── Bucket reduction (summation by parts)                  │
 │  ├── Window combination (double-and-add)                    │
+│  ├── Persistent GPU memory pool                             │
 │  └── Serial fallback for < 64 points                        │
 ├─────────────────────────────────────────────────────────────┤
 │  Elliptic Curve Operations (pallas_curve.cu)                │
@@ -176,8 +180,25 @@ This library is used by [Nova-GPU](https://github.com/raham24/Nova-gpu), a fork 
 
 ### Parallelization
 
-- **Large inputs (>= 64 points)**: Grid of `(num_chunks, 32)` blocks with 256 threads each. Points are chunked into groups of 4096. Per-bucket spin-locks synchronize atomic accumulation across chunks.
+- **Large inputs (>= 64 points)**: 4-phase GPU pipeline:
+  1. **Shared-memory accumulation**: Grid of `(num_chunks, 32)` blocks, 256 threads each. Each block loads 255 buckets into shared memory (~25 KB), accumulates its chunk of points using shared-memory spinlocks (acquire/release fences for correct memory ordering), then writes results to per-chunk global memory.
+  2. **Cross-chunk reduction**: One block per window, each thread reduces one bucket across all chunks.
+  3. **Bucket reduction**: Summation by parts within each window.
+  4. **Window combination**: Double-and-add across windows, high to low.
+- **Adaptive chunk sizes**: `4096` (n <= 16K), `16384` (n <= 256K), `32768` (n > 256K). Larger chunks reduce memory footprint and cross-chunk reduction work.
+- **Persistent memory pool**: Device allocations are cached in static variables and reused across calls, eliminating ~12ms cudaMalloc/cudaFree overhead per invocation.
 - **Small inputs (< 64 points)**: Single-thread serial Pippenger kernel to avoid synchronization overhead.
+
+### Performance
+
+Benchmarked on NVIDIA GeForce RTX 4080 (76 SMs, 16 GB, Compute 8.9):
+
+| Points | CPU (ms) | GPU (ms) | Speedup |
+|--------|----------|----------|---------|
+| 100K   | 75       | 41       | 1.8x    |
+| 200K   | 125      | 62       | 2.0x    |
+| 500K   | 285      | 132      | 2.2x    |
+| 1M     | 512      | 268      | 1.9x    |
 
 ## Acknowledgments
 
