@@ -32,11 +32,11 @@ This library provides a CUDA implementation of MSM for the Pallas curve using Pi
 │  Elliptic Curve Operations (pallas_curve.cu)                │
 │  ├── point_double    (homogeneous projective, a=0)          │
 │  ├── point_add       (EFD add-1998-cmo-2)                   │
-│  ├── point_add_mixed (add-1998-cmo-2, Z2=1)                │
-│  └── projective_to_affine (X/Z, Y/Z)                       │
+│  ├── point_add_mixed (add-1998-cmo-2, Z2=1)                 │
+│  └── projective_to_affine (X/Z, Y/Z)                        │
 ├─────────────────────────────────────────────────────────────┤
 │  Field Arithmetic (pallas_field.cu)                         │
-│  ├── Montgomery multiplication (CIOS, 8x32-bit limbs)      │
+│  ├── Montgomery multiplication (CIOS, 8x32-bit limbs)       │
 │  ├── Field addition/subtraction (mod p)                     │
 │  └── Field inversion (Fermat's little theorem)              │
 └─────────────────────────────────────────────────────────────┘
